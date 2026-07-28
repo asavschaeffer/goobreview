@@ -116,10 +116,23 @@ fi
 mkdir -p "$(dirname "$ENV_FILE")"
 ops_copy_if_missing "$ENV_FILE" "$CONFIG_DIR/reviewer.env.example" || exit 1
 
-[ -n "$repo" ] || repo="$(ops_env_get "$ENV_FILE" REVIEWER_REPO)"
+env_repo="$(ops_env_get "$ENV_FILE" REVIEWER_REPO)"
+[ "$env_repo" != "owner/repo" ] || env_repo=""
+[ -n "$repo" ] || repo="$env_repo"
 [ "$repo" != "owner/repo" ] || repo=""
 [ -n "$app_id" ] || app_id="$(ops_env_get "$ENV_FILE" REVIEWER_APP_ID)"
-[ -n "$installation_id" ] || installation_id="$(ops_env_get "$ENV_FILE" REVIEWER_APP_INSTALLATION_ID)"
+# Repointing an existing deployment at a new repo: the installation ID already
+# in reviewer.env belongs to the OLD repo's installation. Inheriting it here
+# would mint tokens for that installation and 404 on every call against the new
+# repo, so leave it empty and let the discovery below resolve it. An explicit
+# --installation-id still wins.
+if [ -n "$repo" ] && [ -n "$env_repo" ] && [ "$repo" != "$env_repo" ]; then
+  if [ -z "$installation_id" ]; then
+    ops_log "Target repo changed ($env_repo -> $repo); rediscovering installation ID."
+  fi
+else
+  [ -n "$installation_id" ] || installation_id="$(ops_env_get "$ENV_FILE" REVIEWER_APP_INSTALLATION_ID)"
+fi
 [ -n "$key_path" ] || key_path="$(ops_env_get "$ENV_FILE" REVIEWER_APP_PRIVATE_KEY_PATH)"
 [ -n "$posted_personality" ] || posted_personality="$(ops_env_get "$ENV_FILE" REVIEWER_POSTED_PERSONALITY)"
 [ -n "$posted_personality" ] || posted_personality="none"
@@ -221,6 +234,7 @@ ops_log "Configuration written:"
 cat <<EOF
   env:              $ENV_FILE
   repo:             $repo
+  installation:     $(ops_env_get "$ENV_FILE" REVIEWER_APP_INSTALLATION_ID)
   key path:         $key_path
   posted style:     $posted_personality
   research consent: $research_consent

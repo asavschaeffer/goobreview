@@ -238,6 +238,47 @@ Force a re-review of a PR at its current head commit:
 
 Delete the bot's review on GitHub (via the pull request UI or `gh api -X DELETE "repos/OWNER/REPO/pulls/PR/reviews/REVIEW_ID"`), then the daemon will re-review on the next tick.
 
+Repoint the daemon at a different repository:
+
+```bash
+scripts/configure.sh                      # answer the repo prompt with the new owner/repo
+# or, non-interactively:
+scripts/configure-inner.sh --repo NEW_OWNER/NEW_REPO
+```
+
+Changing the target repo also changes the App installation, so
+`REVIEWER_APP_INSTALLATION_ID` must change with it. Both scripts detect the
+repo change and rediscover the ID; do not carry the old one over by hand, or
+the daemon mints tokens for the previous installation and every API call
+against the new repo fails with a 404.
+
+The App must be installed on the new repository first. If it belongs to
+someone else's account or org, only an **admin there** can install it — you
+cannot do it for them, even with push access. Send them a link that pre-selects
+their account so the only choice left is the repository:
+
+```bash
+gh api users/THEIR_LOGIN --jq .id     # numeric account id
+# https://github.com/apps/YOUR_APP_SLUG/installations/new/permissions?suggested_target_id=THAT_ID
+```
+
+Nothing needs to come back from them once they click Install — the installation
+ID is discoverable from your side with `get-installation-token.sh discover`, and
+the cached token in `app_token.json` is keyed on the installation ID, so it
+invalidates itself when the ID changes.
+
+Two things worth re-checking after a repoint: `config/required-checks.json`
+still lists the *old* repo's check names (stale names never match, so the CI
+gate would block every review, while an empty `[]` means no gate at all), and a
+private new target with `REVIEWER_RESEARCH_CONSENT=1` also needs
+`REVIEWER_RESEARCH_ALLOW_PRIVATE=1` or capture silently stops.
+
+Write config backups outside the checkout — `/var/lib/goobreview/example/` is a
+good spot. A stray `config/reviewer.env.bak` used to leave the checkout dirty,
+which makes `sync-worktree.sh` refuse to sync and skip the tick entirely;
+`config/*.bak*` is gitignored now, but the general rule still holds for any
+other file you drop in the checkout.
+
 Run a pre-merge mechanical gate:
 
 ```bash
