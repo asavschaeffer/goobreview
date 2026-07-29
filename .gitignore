@@ -1,5 +1,11 @@
 config/reviewer.env
 config/required-checks.json
+# Operator backups of the two files above. Without this, a habitual
+# `cp reviewer.env reviewer.env.bak` leaves the checkout dirty and
+# sync-worktree.sh refuses to sync, silently skipping every tick.
+config/*.bak
+config/*.bak-*
+config/*.bak.*
 .goobreview-cloud-shell.env
 *.log
 .DS_Store
