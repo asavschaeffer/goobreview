@@ -152,6 +152,7 @@ test_symlink_snapshot_safety
 test_worktree_cache_keeps_per_head_slots
 test_prune_stale_review_worktrees
 test_invalid_verdict_state
+test_head_first_seen_state
 test_artifact_secret_safety
 test_state_and_output_permissions
 test_pr_queue_skip_reasons
@@ -195,6 +196,7 @@ test_reviewer_backoff_skips_recently_failed_pr
 test_reviewer_invalid_output_backoff_skips_before_attempt_budget
 test_reviewer_agy_quota_failure_reacts_and_skips_failure_cap
 test_reviewer_failure_backoff_escalates_and_never_blocks_success
+test_reviewer_followup_settle_window_coalesces_pushes
 test_reviewer_research_capture_posts_selected_review_only
 test_reviewer_posted_trace_flag_controls_review_body
 
@@ -208,10 +210,15 @@ test_reviewer_posted_trace_flag_controls_review_body
 # 617 → 633 for the agy prompt-delivery redesign: AGENTS.md/argv/diff-file
 # split, CI-coverage-context self-serve pointer replacing raw inlining, and
 # the angry narrative reunified into the literal --print argv value.
-# 640 → 650 for the end-to-end REVIEWER_POST_REVIEW_TRACE coverage: the posted
-# review payload is captured from curl's --data argument and asserted on in
-# both flag states, including the REVIEWER_TRACE_MAX_BYTES cut.
-EXPECTED_ASSERTIONS=650
+# 633 → 650 for REVIEWER_POST_REVIEW_TRACE: +7 unit (the trace byte cap, and
+# the prior-review subject skipping a leading <details> block) and +10
+# end-to-end (the posted review payload captured from curl's --data argument
+# and asserted on in both flag states, including the
+# REVIEWER_TRACE_MAX_BYTES cut).
+# 650 → 694 for the follow-up settle window: +18 first-seen state unit
+# assertions, +26 end-to-end (fresh, unsettled, settled, disabled, new push,
+# re-requested).
+EXPECTED_ASSERTIONS=694
 if [ "$pass_count" -ne "$EXPECTED_ASSERTIONS" ]; then
   printf 'not ok - assertion-count tripwire: expected %s, ran %s\n' "$EXPECTED_ASSERTIONS" "$pass_count" >&2
   printf 'If you intentionally changed the number of assertions, update EXPECTED_ASSERTIONS.\n' >&2

@@ -1448,6 +1448,234 @@ EOF
   assert_not_contains "success conclusion carries no attempt marker" "attempt:" "$check_runs_file"
 }
 
+# The follow-up settle window: a PR the bot has never reviewed is reviewed on
+# sight, while a PR it has already reviewed waits until its current head has
+# been observed unchanged for REVIEWER_FOLLOWUP_SETTLE_SECONDS. CI is mocked
+# as failing throughout, so a PR that clears the gate takes the CI-failure
+# fast path -- no agy call, but check-ci.sh is invoked and a review is posted,
+# which makes "was this PR reviewed this tick?" directly observable.
+test_reviewer_followup_settle_window_coalesces_pushes() {
+  local state_dir runtime_dir test_reviewer env_file key_file bin_dir
+  local ci_count posts_file first_seen_file status output settled_at
+
+  state_dir="$TMP_ROOT/settle-state"
+  runtime_dir="$TMP_ROOT/settle-runtime"
+  test_reviewer="$TMP_ROOT/settle-reviewer"
+  bin_dir="$TMP_ROOT/settle-bin"
+  ci_count="$TMP_ROOT/settle-ci-count"
+  posts_file="$TMP_ROOT/settle-posts"
+  first_seen_file="$state_dir/head_first_seen.json"
+  mkdir -p "$state_dir" "$runtime_dir" "$bin_dir"
+  chmod 700 "$state_dir" "$runtime_dir"
+  cp -R "$REVIEWER_DIR" "$test_reviewer"
+  : > "$posts_file"
+
+  cat > "$test_reviewer/get-installation-token.sh" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  token) printf 'test-token\n' ;;
+  slug)  printf 'goobreview\n' ;;
+  *)     exit 1 ;;
+esac
+EOF
+  chmod +x "$test_reviewer/get-installation-token.sh"
+
+  cat > "$test_reviewer/check-ci.sh" <<EOF
+#!/usr/bin/env bash
+count=\$(cat "$ci_count" 2>/dev/null || printf 0)
+count=\$((count + 1))
+printf '%s\n' "\$count" > "$ci_count"
+printf 'failing\n'
+EOF
+  chmod +x "$test_reviewer/check-ci.sh"
+
+  cat > "$bin_dir/curl" <<'EOF'
+#!/usr/bin/env bash
+method=GET
+body_file=""
+url="${*: -1}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -X)
+      method="$2"
+      shift 2
+      ;;
+    -o)
+      body_file="$2"
+      shift 2
+      ;;
+    -D|-w|-H|--data)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+case "$method $url" in
+  *'GET '*'repos/example/repo/pulls?state=open&per_page=100&page=1')
+    printf '[{"number":1,"draft":false,"user":{"login":"alice"},"head":{"sha":"%s"},"requested_reviewers":%s}]\n' "$PR_HEAD" "$REQUESTED_REVIEWERS" > "$body_file"
+    printf '200'
+    ;;
+  *'GET '*'repos/example/repo/pulls/1/reviews?per_page=100&page=1')
+    printf '%s\n' "$PRIOR_REVIEWS" > "$body_file"
+    printf '200'
+    ;;
+  *'GET '*'repos/example/repo/issues/1/comments?per_page=100&page=1')
+    printf '%s\n' '[]' > "$body_file"
+    printf '200'
+    ;;
+  *'GET '*'/check-runs?filter=latest'*)
+    printf '%s\n' '{"total_count":1,"check_runs":[{"name":"ci","status":"completed","conclusion":"failure"}]}' > "$body_file"
+    printf '200'
+    ;;
+  *'POST '*'repos/example/repo/issues/1/reactions')
+    printf '%s\n' '{"id":1,"content":"eyes"}' > "$body_file"
+    printf '201'
+    ;;
+  *'POST '*'repos/example/repo/check-runs')
+    printf '%s\n' '{"id":77}' > "$body_file"
+    printf '201'
+    ;;
+  *'PATCH '*'repos/example/repo/check-runs/77')
+    printf '%s\n' '{"id":77}' > "$body_file"
+    printf '200'
+    ;;
+  *'POST '*'repos/example/repo/pulls/1/reviews')
+    printf 'posted %s\n' "$PR_HEAD" >> "$POSTS_FILE"
+    printf '%s\n' '{"id":1}' > "$body_file"
+    printf '200'
+    ;;
+  *)
+    printf 'unexpected curl %s %s\n' "$method" "$url" >&2
+    printf '000'
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$bin_dir/curl"
+
+  cat > "$bin_dir/agy" <<'EOF'
+#!/usr/bin/env bash
+printf 'Looks good.\nAPPROVE\n'
+EOF
+  chmod +x "$bin_dir/agy"
+
+  cat > "$bin_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$bin_dir/gh"
+
+  key_file="$TMP_ROOT/settle-key.pem"
+  printf 'key\n' > "$key_file"
+  chmod 600 "$key_file"
+
+  printf '## Role\nReview.\n' > "$TMP_ROOT/settle-personality.md"
+  printf 'Final non-empty line: APPROVE, REQUEST_CHANGES, or COMMENT.\n' > "$TMP_ROOT/settle-engine.md"
+  printf '["ci"]\n' > "$TMP_ROOT/settle-required.json"
+
+  env_file="$TMP_ROOT/settle.env"
+  cat > "$env_file" <<EOF
+REVIEWER_REPO=example/repo
+REVIEWER_STATE=$state_dir
+REVIEWER_RUNTIME_STATE=$runtime_dir
+REVIEWER_APP_ID=1
+REVIEWER_APP_INSTALLATION_ID=2
+REVIEWER_APP_PRIVATE_KEY_PATH=$key_file
+REVIEWER_PERSONALITY_FILE=$TMP_ROOT/settle-personality.md
+REVIEWER_PROMPT=$TMP_ROOT/settle-engine.md
+REVIEWER_REQUIRED_CHECKS_FILE=$TMP_ROOT/settle-required.json
+REVIEWER_MAX_PRS=1
+REVIEWER_MAX_ATTEMPTS=1
+REVIEWER_FOLLOWUP_SETTLE_SECONDS=300
+EOF
+
+  settle_tick() {
+    local label="$1"
+    local head="$2"
+    local reviews="$3"
+    local requested="${4:-[]}"
+    local tick_status=0
+    local tick_output
+
+    # shellcheck disable=SC1090 # Fixture env file is created dynamically above.
+    tick_output=$(set -a; . "$env_file"; set +a;
+      PR_HEAD="$head" PRIOR_REVIEWS="$reviews" REQUESTED_REVIEWERS="$requested" POSTS_FILE="$posts_file" \
+      PATH="$bin_dir:$PATH" bash "$test_reviewer/reviewer.sh" 2>&1) || tick_status=$?
+    if [ "$tick_status" -ne 0 ]; then
+      printf '%s\n' "$tick_output" >&2
+      fail "$label"
+    fi
+    pass "$label"
+  }
+
+  # (a) Never reviewed before: reviewed on the very tick that first sees this
+  # head, with no settle wait at all. First-feedback latency must not regress.
+  settle_tick "settle fixture reviews a never-reviewed PR immediately" sha1 '[]'
+  assert_eq "fresh PR reaches the CI gate on its first sighting" "1" "$(cat "$ci_count")"
+  assert_contains "fresh PR is reviewed without waiting to settle" "posted sha1" "$posts_file"
+  assert_not_contains "fresh PR logs no settle wait" "waiting for head" "$state_dir/log.txt"
+  assert_eq "the reviewed head is recorded as first seen" "1" "$(jq -r '."1@sha1" | if . == null then 0 else 1 end' "$first_seen_file")"
+
+  # (b) Follow-up on a head pushed just now: skipped until it settles, before
+  # the CI gate and before any GitHub side effect.
+  rm -f "$ci_count"
+  : > "$posts_file"
+  : > "$state_dir/log.txt"
+  settle_tick "settle fixture skips an unsettled follow-up" sha2 '[{"user":{"login":"goobreview[bot]"},"commit_id":"sha1","state":"COMMENTED"}]'
+  assert_contains "unsettled follow-up logs the head and the remaining wait" "PR #1@sha2: follow-up review waiting for head sha2 to settle," "$state_dir/log.txt"
+  assert_contains "unsettled follow-up reports the configured window" "s of 300s remaining" "$state_dir/log.txt"
+  assert_eq "unsettled follow-up never reaches the CI gate" "0" "$(cat "$ci_count" 2>/dev/null || printf 0)"
+  assert_not_contains "unsettled follow-up posts nothing" "posted" "$posts_file"
+
+  # (c) Same head, now observed unchanged for longer than the window.
+  settled_at=$(( $(date +%s) - 400 ))
+  printf '{"1@sha2":%s}\n' "$settled_at" > "$first_seen_file"
+  : > "$state_dir/log.txt"
+  settle_tick "settle fixture reviews a settled follow-up" sha2 '[{"user":{"login":"goobreview[bot]"},"commit_id":"sha1","state":"COMMENTED"}]'
+  assert_eq "settled follow-up reaches the CI gate" "1" "$(cat "$ci_count")"
+  assert_contains "settled follow-up is reviewed" "posted sha2" "$posts_file"
+  assert_not_contains "settled follow-up logs no further wait" "waiting for head" "$state_dir/log.txt"
+
+  # (d) The window is opt-out: 0 restores review-every-new-head behavior.
+  rm -f "$ci_count"
+  : > "$posts_file"
+  : > "$state_dir/log.txt"
+  printf 'REVIEWER_FOLLOWUP_SETTLE_SECONDS=0\n' >> "$env_file"
+  settle_tick "settle fixture honors a disabled window" sha3 '[{"user":{"login":"goobreview[bot]"},"commit_id":"sha1","state":"COMMENTED"}]'
+  assert_eq "a zero settle window reviews a brand new head immediately" "1" "$(cat "$ci_count")"
+  assert_contains "a zero settle window posts on the new head" "posted sha3" "$posts_file"
+  assert_not_contains "a zero settle window logs no wait" "waiting for head" "$state_dir/log.txt"
+  sed -i '/^REVIEWER_FOLLOWUP_SETTLE_SECONDS=0$/d' "$env_file"
+
+  # (e) A new push restarts the timer: sha3 has been settled for hours, but the
+  # push to sha4 is a new key, so the follow-up waits again. The end-of-tick
+  # prune also drops the superseded head's record.
+  rm -f "$ci_count"
+  : > "$posts_file"
+  : > "$state_dir/log.txt"
+  printf '{"1@sha3":%s}\n' "$(( $(date +%s) - 36000 ))" > "$first_seen_file"
+  settle_tick "settle fixture skips the head a push created" sha4 '[{"user":{"login":"goobreview[bot]"},"commit_id":"sha3","state":"COMMENTED"}]'
+  assert_contains "a new push restarts the settle timer" "PR #1@sha4: follow-up review waiting for head sha4 to settle," "$state_dir/log.txt"
+  assert_eq "the pushed-over head does not lend its settled timer" "0" "$(cat "$ci_count" 2>/dev/null || printf 0)"
+  assert_eq "the new head is recorded" "1" "$(jq -r '."1@sha4" | if . == null then 0 else 1 end' "$first_seen_file")"
+  assert_eq "the superseded head's record is pruned at end of tick" "1" "$(jq -r 'length' "$first_seen_file")"
+
+  # (f) An explicitly re-requested review is a human asking for feedback now,
+  # so it bypasses the wait the same way it bypasses the reviewed-SHA skip.
+  rm -f "$ci_count"
+  : > "$posts_file"
+  : > "$state_dir/log.txt"
+  settle_tick "settle fixture reviews a re-requested unsettled head" sha5 \
+    '[{"user":{"login":"goobreview[bot]"},"commit_id":"sha3","state":"COMMENTED"}]' \
+    '[{"login":"goobreview[bot]"}]'
+  assert_eq "a re-requested review does not wait for the head to settle" "1" "$(cat "$ci_count")"
+  assert_contains "a re-requested review posts on the unsettled head" "posted sha5" "$posts_file"
+
+  unset -f settle_tick
+}
+
 test_reviewer_research_capture_posts_selected_review_only() {
   local state_dir runtime_dir test_reviewer env_file key_file bin_dir config_dir status output
   local source_dir tarball review_payload reactions_file check_runs_file posted_body manifest research_dir dry_run_out dry_comments_json
