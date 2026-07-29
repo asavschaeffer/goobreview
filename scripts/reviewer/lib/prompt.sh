@@ -161,6 +161,24 @@ review_subject_from_body() {
     {
       line = $0
       sub(/\r$/, "", line)
+
+      # Skip a leading <details> block and the horizontal rule that follows
+      # it. That wrapper is the daemon-added review trace, not the review the
+      # model wrote: its paragraphs are bold text rather than headings, so
+      # without this the subject resolves to the literal "<details>" line, or to the
+      # first heading occurring *after* the trace -- which is whatever
+      # section the review happens to end on, not what it decided.
+      if (in_details) {
+        if (line ~ /<\/details>/) in_details = 0
+        next
+      }
+      if (!seen_content && line ~ /^[[:space:]]*<details/) {
+        in_details = 1
+        next
+      }
+      if (!seen_content && line ~ /^[[:space:]]*(-{3,}|\*{3,}|_{3,})[[:space:]]*$/) next
+      if (line ~ /[^[:space:]]/) seen_content = 1
+
       if (fallback == "" && line ~ /[^[:space:]]/) fallback = line
       if (line ~ /^[[:space:]]*#{1,6}[[:space:]]+/) {
         subject = line

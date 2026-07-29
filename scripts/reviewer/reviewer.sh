@@ -37,6 +37,8 @@ DIFF_FILE_MAX_BYTES="${REVIEWER_DIFF_FILE_MAX_BYTES:-40000}"
 DESCRIPTION_MAX_BYTES="${REVIEWER_DESCRIPTION_MAX_BYTES:-12000}"
 SUGGESTION_MAX_LINES="${REVIEWER_SUGGESTION_MAX_LINES:-12}"
 PREVIOUS_REVIEW_MAX_BYTES="${REVIEWER_PREVIOUS_REVIEW_MAX_BYTES:-500}"
+POST_REVIEW_TRACE="${REVIEWER_POST_REVIEW_TRACE:-0}"
+TRACE_MAX_BYTES="${REVIEWER_TRACE_MAX_BYTES:-20000}"
 PRIOR_THREAD_SUMMARY_LIMIT="${REVIEWER_PRIOR_THREAD_SUMMARY_LIMIT:-12}"
 PRIOR_THREAD_BODY_MAX_BYTES="${REVIEWER_PRIOR_THREAD_BODY_MAX_BYTES:-500}"
 COMMIT_SUBJECTS_MAX="${REVIEWER_COMMIT_SUBJECTS_MAX:-10}"
@@ -1301,8 +1303,20 @@ $filtered_body
 EOF
 )
   fi
+  # REVIEWER_POST_REVIEW_TRACE governs only the sidecar thinking trace, which
+  # the daemon adds to a body the model did not put it in. Off by default: the
+  # trace routinely dwarfs the review it is attached to, every API consumer
+  # (including this daemon reading its own prior review) receives it in full
+  # because <details> only collapses in a browser, and it is already retained
+  # in the sidecar, the research artifacts, and agy's own transcripts.
+  #
+  # The else branch is unrelated to the flag: it collapses trace-like prose the
+  # model wrote into its own review body. That text is the model's output, not
+  # something the daemon appended, so it stays either way -- only its
+  # formatting changes.
   thinking_trace_file="${RUNTIME_STATE_DIR:-$STATE_DIR/runtime}/agy-runtime/thinking.trace"
-  if trace_block=$(review_trace_details_block "$thinking_trace_file" "$head_sha" "$REPO" "$review_worktree"); then
+  if [ "$POST_REVIEW_TRACE" = "1" ] &&
+    trace_block=$(review_trace_details_block "$thinking_trace_file" "$head_sha" "$REPO" "$review_worktree"); then
     formatted_body=$(review_body_with_trace_prefix "$trace_block" "$filtered_body")
   else
     formatted_body=$(printf '%s\n' "$filtered_body" | review_trace_to_details "$head_sha" "$REPO" "$review_worktree")
