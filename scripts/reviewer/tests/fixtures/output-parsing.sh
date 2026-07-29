@@ -536,6 +536,24 @@ test_trace_to_details() {
   assert_contains "sidecar trace leaves missing path unlinked" '`missing.ts`' <(printf '%s' "$trace_block")
   assert_contains "sidecar trace details ends with separator" "---" <(printf '%s' "$trace_block")
 
+  # A trace is unbounded model output prefixed onto a body that must fit
+  # GitHub's 65536-character review-body limit, so an uncapped verbose run
+  # does not degrade the review -- it fails to post it.
+  local big_trace_file capped_block _i
+  big_trace_file="$TMP_ROOT/big.trace"
+  : > "$big_trace_file"
+  for _i in $(seq 1 200); do
+    printf 'Line %s of narration that pads the trace out.\n' "$_i" >> "$big_trace_file"
+  done
+  capped_block=$(review_trace_details_block "$big_trace_file" "abc123" "owner/repo" "" 400)
+  assert_contains "capped trace marks what it dropped" \
+    "[goobreview: review trace truncated after 400 bytes of" <(printf '%s' "$capped_block")
+  assert_contains "capped trace keeps the head" "Line 1 of narration" <(printf '%s' "$capped_block")
+  assert_not_contains "capped trace drops the tail" "Line 200 of narration" <(printf '%s' "$capped_block")
+  capped_block=$(review_trace_details_block "$big_trace_file" "abc123" "owner/repo" "" 100000)
+  assert_contains "trace under the cap is emitted whole" "Line 200 of narration" <(printf '%s' "$capped_block")
+  assert_not_contains "trace under the cap carries no marker" "truncated after" <(printf '%s' "$capped_block")
+
   # Regression (mog-template #179): reviewer.sh captures trace_block via
   # command substitution, which strips the trailing blank lines that
   # review_trace_details_block emits after "---", so a naive concatenation

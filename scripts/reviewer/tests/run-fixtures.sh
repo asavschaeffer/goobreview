@@ -207,7 +207,7 @@ test_reviewer_research_capture_posts_selected_review_only
 # 617 → 633 for the agy prompt-delivery redesign: AGENTS.md/argv/diff-file
 # split, CI-coverage-context self-serve pointer replacing raw inlining, and
 # the angry narrative reunified into the literal --print argv value.
-EXPECTED_ASSERTIONS=633
+EXPECTED_ASSERTIONS=640
 if [ "$pass_count" -ne "$EXPECTED_ASSERTIONS" ]; then
   printf 'not ok - assertion-count tripwire: expected %s, ran %s\n' "$EXPECTED_ASSERTIONS" "$pass_count" >&2
   printf 'If you intentionally changed the number of assertions, update EXPECTED_ASSERTIONS.\n' >&2
