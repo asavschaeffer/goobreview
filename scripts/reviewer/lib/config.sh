@@ -209,6 +209,9 @@ validate_reviewer_config() {
   fi
   validate_uint_env REVIEWER_MAX_PRS "$MAX_PRS"
   validate_uint_env REVIEWER_MAX_ATTEMPTS "$MAX_ATTEMPTS"
+  # Deliberately the non-negative validator: 0 is the documented way to
+  # disable the follow-up settle window, so it must not be rejected.
+  validate_uint_env REVIEWER_FOLLOWUP_SETTLE_SECONDS "$FOLLOWUP_SETTLE_SECONDS"
   validate_uint_env REVIEWER_AGY_QUOTA_DEFAULT_BACKOFF "$AGY_QUOTA_DEFAULT_BACKOFF"
   validate_uint_env REVIEWER_AGY_QUOTA_BACKOFF_PADDING "$AGY_QUOTA_BACKOFF_PADDING"
   validate_uint_env REVIEWER_AGY_QUOTA_MAX_BACKOFF "$AGY_QUOTA_MAX_BACKOFF"

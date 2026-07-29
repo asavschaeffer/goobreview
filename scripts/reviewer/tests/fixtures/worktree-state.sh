@@ -155,6 +155,51 @@ test_prune_stale_review_worktrees() {
   pass "prune is a no-op when no snapshot cache exists"
 }
 
+# The follow-up settle window measures head stability from the daemon's own
+# first sighting of a (PR, head SHA) pair, because commit and push dates are
+# rewritten by rebases, amends and force-pushes. These cover the record's
+# idempotence (the timer starts once per head), the keying (a push is a new
+# key, so the timer restarts), the settle arithmetic, and the two bounds on
+# file growth.
+test_head_first_seen_state() {
+  local file
+
+  STATE_DIR="$TMP_ROOT/first-seen-state"
+  mkdir -p "$STATE_DIR"
+  file=$(head_first_seen_file)
+
+  assert_eq "first sighting records the observed epoch" "1000" "$(record_head_first_seen 7 sha-a 1000)"
+  assert_file_mode "first-seen state is owner-only" "600" "$file"
+  assert_eq "re-observing a head keeps its original first-seen epoch" "1000" "$(record_head_first_seen 7 sha-a 5000)"
+  assert_eq "a new head SHA on the same PR starts its own timer" "5000" "$(record_head_first_seen 7 sha-b 5000)"
+  assert_eq "the superseded head keeps its own record" "1000" "$(record_head_first_seen 7 sha-a 9000)"
+  assert_eq "the same SHA on another PR is tracked separately" "9000" "$(record_head_first_seen 8 sha-a 9000)"
+
+  assert_eq "an unsettled head reports the seconds still to wait" "200" "$(head_settle_remaining_seconds 1000 300 1100)"
+  assert_eq "a head at exactly the settle window is settled" "0" "$(head_settle_remaining_seconds 1000 300 1300)"
+  assert_eq "a settle window of 0 is always satisfied" "0" "$(head_settle_remaining_seconds 1000 0 1000)"
+  assert_eq "backwards clock skew costs at most one settle window" "300" "$(head_settle_remaining_seconds 2000 300 1000)"
+
+  # Keep-set prune, mirroring the snapshot cache: only live open-PR heads stay.
+  prune_stale_head_first_seen "7@sha-b" "8@sha-a"
+  assert_eq "prune keeps records for live heads" "5000" "$(jq -r '."7@sha-b" // "missing"' "$file")"
+  assert_eq "prune drops records for heads that are no longer open PR heads" "missing" "$(jq -r '."7@sha-a" // "missing"' "$file")"
+  prune_stale_head_first_seen
+  assert_eq "prune with an empty keep-set clears every record" "0" "$(jq -r 'length' "$file")"
+
+  # TTL floor on write, for deployments whose ticks never reach the prune.
+  printf '%s\n' '{"7@ancient":1,"7@recent":100}' > "$file"
+  assert_eq "writing a record admits the current head" "2592100" "$(record_head_first_seen 7 sha-c 2592100)"
+  assert_eq "records past the TTL are dropped on write" "missing" "$(jq -r '."7@ancient" // "missing"' "$file")"
+  assert_eq "records inside the TTL survive a write" "100" "$(jq -r '."7@recent" // "missing"' "$file")"
+
+  # A corrupt or truncated state file is recreated, never fatal: the daemon
+  # owns the file outright and nothing in it is irreplaceable.
+  printf 'not json at all\n' > "$file"
+  assert_eq "a corrupt state file still records the current head" "1234" "$(record_head_first_seen 9 sha-z 1234)"
+  assert_eq "a corrupt state file is recreated from scratch" "1" "$(jq -r 'length' "$file")"
+}
+
 test_invalid_verdict_state() {
   local artifact runs_json
 

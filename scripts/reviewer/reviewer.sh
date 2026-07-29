@@ -48,6 +48,10 @@ RESEARCH_ALLOW_PRIVATE="${REVIEWER_RESEARCH_ALLOW_PRIVATE:-0}"
 REFUSE_ON_HOME_CONTEXT="${REVIEWER_REFUSE_ON_HOME_CONTEXT:-0}"
 MAX_PRS="${REVIEWER_MAX_PRS:-1}"
 MAX_ATTEMPTS="${REVIEWER_MAX_ATTEMPTS:-$MAX_PRS}"
+# Follow-up settle window: how long a head SHA must have been observed
+# unchanged before the daemon re-reviews a PR it has already reviewed. A PR
+# with no prior bot review is never delayed. 0 disables the wait entirely.
+FOLLOWUP_SETTLE_SECONDS="${REVIEWER_FOLLOWUP_SETTLE_SECONDS:-300}"
 AUTO_RESOLVE_BOT_THREADS="${REVIEWER_AUTO_RESOLVE_BOT_THREADS:-0}"
 CHECK_RUN_SIGNAL="${REVIEWER_CHECK_RUN_SIGNAL:-1}"
 STATE_DIR="${REVIEWER_STATE:-$HOME/.goobreview}"
@@ -956,6 +960,7 @@ review_one_pr() {
   local draft="$4"
   local pr_json_b64="$5"
   local pr_metadata_json skip_reason bot_reviews_json requested_review existing
+  local head_first_seen prior_bot_reviews settle_remaining
   local failure_attempts invalid_attempts invalid_artifact ci_state ci_summary ci_failure_body
   local prompt_tmp diff_tmp final_print_arg_tmp review_worktree review_threads_json unresolved_bot_threads_json prompt_thread_handle_map_json
   local agy_err_tmp agy_started_at agy_review_status review verdict_line event review_body
@@ -1006,6 +1011,44 @@ review_one_pr() {
         log "PR #$num@$head_sha already reviewed by $BOT_LOGIN, but review was re-requested; reviewing again"
       else
         log "PR #$num@$head_sha already reviewed by $BOT_LOGIN, skipping"
+        return 0
+      fi
+    fi
+  fi
+
+  # Follow-up settle window. A PR the bot has never reviewed is reviewed on
+  # sight -- first-feedback latency is the product -- so this gate only ever
+  # delays a PR that already carries at least one bot review. For those, wait
+  # until the current head has been observed unchanged for
+  # REVIEWER_FOLLOWUP_SETTLE_SECONDS, so a burst of pushes on an actively
+  # worked PR coalesces into a single review of the final head instead of one
+  # ~2-minute agy call per push (most of which the post-flight staleness guard
+  # would discard anyway, after spending the quota).
+  #
+  # "Observed unchanged" is measured from the daemon's own first sighting of
+  # (PR, head SHA), never from a commit or push date: rebases, amends and
+  # force-pushes rewrite those arbitrarily. A push changes the SHA, so the
+  # timer resets by construction.
+  #
+  # Runs before the attempt budget and before any GitHub side effects: a PR
+  # skipped after the increment would spend REVIEWER_MAX_ATTEMPTS every tick
+  # and starve every PR behind it (same reasoning as the backoff gate below).
+  # Dry-run/render-only ticks are exempt and record nothing, so a manual
+  # inspection run never waits and never perturbs the daemon's timers.
+  if [ -z "$RENDER_PROMPT_ONLY" ] && [ -z "$DRY_RUN" ]; then
+    if ! head_first_seen=$(record_head_first_seen "$num" "$head_sha"); then
+      log "PR #$num@$head_sha: failed to record head first-seen time, treating head as settled"
+      head_first_seen=0
+    fi
+    if ! prior_bot_reviews=$(printf '%s\n' "$bot_reviews_json" | jq 'length'); then
+      prior_bot_reviews=0
+    fi
+    # An explicitly re-requested review is a human asking for feedback now, so
+    # it bypasses the wait exactly as it bypasses the already-reviewed skip.
+    if [ "$prior_bot_reviews" -gt 0 ] && [ "${requested_review:-0}" -ne 1 ]; then
+      settle_remaining=$(head_settle_remaining_seconds "$head_first_seen" "$FOLLOWUP_SETTLE_SECONDS" "$(date +%s)")
+      if [ "$settle_remaining" -gt 0 ]; then
+        log "PR #$num@$head_sha: follow-up review waiting for head $head_sha to settle, ${settle_remaining}s of ${FOLLOWUP_SETTLE_SECONDS}s remaining"
         return 0
       fi
     fi
@@ -1383,4 +1426,10 @@ done <<< "$PRS"
 if [ -z "$ONLY_PR" ] && [ -z "$DRY_RUN" ] && [ -z "$RENDER_PROMPT_ONLY" ]; then
   mapfile -t live_head_shas < <(printf '%s\n' "$PRS" | cut -f3)
   prune_stale_review_worktrees "${live_head_shas[@]}"
+  # Same keep-set discipline for the settle-window records, for the same
+  # reason: a record is dead once its (PR, SHA) stops being an open PR head,
+  # and the single-PR paths must not evict the other open PRs' timers.
+  mapfile -t live_head_keys < <(printf '%s\n' "$PRS" | awk -F'\t' 'NF { print $1 "@" $3 }')
+  prune_stale_head_first_seen "${live_head_keys[@]}" ||
+    log "Failed to prune stale head first-seen records (continuing)"
 fi

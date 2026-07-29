@@ -598,6 +598,134 @@ review_backoff_seconds_for_attempt() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Follow-up settle window state.
+#
+# The daemon records when it FIRST OBSERVED a given (PR number, head SHA) pair
+# so it can tell how long a head has been stable. Commit and push dates from
+# GitHub cannot answer that question: a rebase, an amend, or a force-push
+# rewrites committer dates arbitrarily, so a "fresh" head can carry an ancient
+# date and vice versa. The daemon's own first sighting is the only monotonic
+# signal available.
+#
+# Layout: a flat JSON object in the state dir, "<pr>@<sha>" -> epoch seconds.
+# Because a new push produces a new SHA, it produces a new key, so the settle
+# timer restarts on its own and a burst of pushes coalesces into one review.
+# ---------------------------------------------------------------------------
+
+# Entries older than this are dropped on write. This is a safety net on top of
+# prune_stale_head_first_seen (which is the real bound, keyed on the live open
+# PR heads) for deployments whose ticks always take a single-PR path and so
+# never reach the keep-set prune. 30 days is orders of magnitude longer than
+# any sane settle window, so an entry this old belongs to a head nobody is
+# pushing to; re-recording it costs at most one extra settle window.
+HEAD_FIRST_SEEN_TTL_SECONDS=2592000
+
+head_first_seen_file() {
+  printf '%s/head_first_seen.json\n' "$STATE_DIR"
+}
+
+head_first_seen_key() {
+  printf '%s@%s\n' "$1" "$2"
+}
+
+# Current records, or an empty object when the file is absent, unreadable, or
+# not a JSON object. The daemon fully owns this file and it carries no
+# irreplaceable state, so corruption is recreated silently rather than
+# crashing a tick.
+head_first_seen_json() {
+  local file
+
+  file=$(head_first_seen_file)
+  [ -f "$file" ] || { printf '{}\n'; return 0; }
+  if ! jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
+    printf '{}\n'
+    return 0
+  fi
+  cat "$file"
+}
+
+# Idempotently record the first sighting of (PR, head SHA) and echo the
+# recorded epoch: an existing record is returned untouched, so the timer is
+# only ever started once per head. Written temp-file + mv (mode 0600) so an
+# interrupted tick cannot leave a truncated file behind.
+record_head_first_seen() {
+  local num="$1"
+  local head_sha="$2"
+  local now="${3:-$(date +%s)}"
+  local file key existing tmp cutoff
+
+  file=$(head_first_seen_file)
+  key=$(head_first_seen_key "$num" "$head_sha")
+  existing=$(head_first_seen_json | jq -r --arg k "$key" '.[$k] // empty | tostring')
+  case "$existing" in
+    ''|*[!0-9]*) ;;
+    *)
+      printf '%s\n' "$existing"
+      return 0
+      ;;
+  esac
+
+  cutoff=$((now - HEAD_FIRST_SEEN_TTL_SECONDS))
+  mkdir -p "$STATE_DIR"
+  tmp=$(mktemp "$STATE_DIR/head-first-seen.XXXXXX")
+  if ! head_first_seen_json |
+    jq --arg k "$key" --argjson now "$now" --argjson cutoff "$cutoff" \
+      'with_entries(select((.value | type) == "number" and .value >= $cutoff))
+       + {($k): $now}' >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file" || return 1
+  printf '%s\n' "$now"
+}
+
+# Bound the file to the current open-PR heads, mirroring the PR-head snapshot
+# cache prune: a record is only useful while its (PR, SHA) is still a live
+# head, so the file stays proportional to the open-PR working set. Called once
+# per tick with every live "<pr>@<sha>" key; no arguments means no open PRs,
+# which correctly empties the file.
+prune_stale_head_first_seen() {
+  local file tmp keep_json
+
+  file=$(head_first_seen_file)
+  [ -f "$file" ] || return 0
+  keep_json=$(printf '%s\n' "$@" | jq -R -s 'split("\n") | map(select(length > 0))') || return 1
+  tmp=$(mktemp "$STATE_DIR/head-first-seen.XXXXXX")
+  if ! head_first_seen_json |
+    jq --argjson keep "$keep_json" \
+      'with_entries(select(.key as $k | $keep | index($k) != null))' >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file" || return 1
+}
+
+# Seconds this head still has to settle, or 0 when the wait is satisfied or
+# disabled (settle_seconds=0). Clock skew that puts the record in the future
+# can only ever cost one full settle window, never an unbounded wait.
+head_settle_remaining_seconds() {
+  local first_seen="$1"
+  local settle_seconds="$2"
+  local now="$3"
+  local elapsed
+
+  if [ "$settle_seconds" -le 0 ]; then
+    printf '0\n'
+    return 0
+  fi
+  elapsed=$((now - first_seen))
+  if [ "$elapsed" -ge "$settle_seconds" ]; then
+    printf '0\n'
+  elif [ "$elapsed" -lt 0 ]; then
+    printf '%s\n' "$settle_seconds"
+  else
+    printf '%s\n' "$((settle_seconds - elapsed))"
+  fi
+}
+
 invalid_verdict_artifact_path() {
   local num="$1"
 
