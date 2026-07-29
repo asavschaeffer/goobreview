@@ -845,12 +845,40 @@ function linkify(s,    result, rest, token, tok_start, tok_len, quoted, path, fr
   fi
 }
 
+# Emit at most max_bytes of the trace file, cutting on a line boundary and
+# marking what was dropped. A trace is unbounded model output, and the posted
+# body it is prefixed onto has to fit GitHub's 65536-character review-body
+# limit, so an uncapped verbose run does not degrade -- the review fails to
+# post at all. LC_ALL=C makes awk's length() count bytes, not characters.
+review_trace_capped() {
+  local trace_file="$1" max_bytes="${2:-0}" total
+
+  total=$(wc -c <"$trace_file" | tr -d ' ')
+  if [ "$max_bytes" -le 0 ] || [ "$total" -le "$max_bytes" ]; then
+    cat "$trace_file"
+    return 0
+  fi
+
+  LC_ALL=C awk -v max="$max_bytes" '
+    {
+      len = length($0) + 1
+      if (used + len > max) exit
+      used += len
+      print
+    }
+  ' "$trace_file"
+  printf '\n[goobreview: review trace truncated after %s bytes of %s]\n' \
+    "$max_bytes" "$total"
+}
+
 review_trace_details_block() {
   local trace_file="$1" head_sha="${2:-}" repo="${3:-}" worktree_dir="${4:-}"
+  local max_bytes="${5:-${TRACE_MAX_BYTES:-20000}}"
 
   [ -s "$trace_file" ] || return 1
   printf '<details><summary>Review trace</summary>\n\n'
-  review_trace_paths_to_links "$head_sha" "$repo" "$worktree_dir" <"$trace_file"
+  review_trace_capped "$trace_file" "$max_bytes" |
+    review_trace_paths_to_links "$head_sha" "$repo" "$worktree_dir"
   printf '\n</details>\n\n---\n\n'
 }
 

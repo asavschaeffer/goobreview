@@ -198,6 +198,7 @@ test_reviewer_agy_quota_failure_reacts_and_skips_failure_cap
 test_reviewer_failure_backoff_escalates_and_never_blocks_success
 test_reviewer_followup_settle_window_coalesces_pushes
 test_reviewer_research_capture_posts_selected_review_only
+test_reviewer_posted_trace_flag_controls_review_body
 
 # Assertion-count tripwire. Each assert_* and bare pass increments pass_count,
 # so a dropped assertion (e.g. two calls collapsed onto one physical line, where
@@ -209,10 +210,15 @@ test_reviewer_research_capture_posts_selected_review_only
 # 617 → 633 for the agy prompt-delivery redesign: AGENTS.md/argv/diff-file
 # split, CI-coverage-context self-serve pointer replacing raw inlining, and
 # the angry narrative reunified into the literal --print argv value.
-# 633 → 677 for the follow-up settle window: +18 first-seen state unit
+# 633 → 650 for REVIEWER_POST_REVIEW_TRACE: +7 unit (the trace byte cap, and
+# the prior-review subject skipping a leading <details> block) and +10
+# end-to-end (the posted review payload captured from curl's --data argument
+# and asserted on in both flag states, including the
+# REVIEWER_TRACE_MAX_BYTES cut).
+# 650 → 694 for the follow-up settle window: +18 first-seen state unit
 # assertions, +26 end-to-end (fresh, unsettled, settled, disabled, new push,
 # re-requested).
-EXPECTED_ASSERTIONS=677
+EXPECTED_ASSERTIONS=694
 if [ "$pass_count" -ne "$EXPECTED_ASSERTIONS" ]; then
   printf 'not ok - assertion-count tripwire: expected %s, ran %s\n' "$EXPECTED_ASSERTIONS" "$pass_count" >&2
   printf 'If you intentionally changed the number of assertions, update EXPECTED_ASSERTIONS.\n' >&2

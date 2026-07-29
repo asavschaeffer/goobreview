@@ -198,11 +198,23 @@ if [ "$current_repo" = "owner/repo" ]; then
   current_repo=""
 fi
 repo="$current_repo"
+if [ -n "$current_repo" ]; then
+  # Offer the configured repo as the default rather than assuming it: this is
+  # the only way to repoint an existing deployment at a new target.
+  repo="$(ask 'Target GitHub repository (owner/repo)' "$current_repo")"
+fi
 if [ -z "$repo" ]; then
   discover_repo_from_app || true
 fi
 if [ -z "$repo" ]; then
   repo="$(ask 'Target GitHub repository (owner/repo)' "$current_repo")"
+fi
+if [ -n "$current_repo" ] && [ "$repo" != "$current_repo" ] && [ -n "$installation_id" ]; then
+  # The retained installation ID belongs to the previous repo. Passing it on
+  # would point the daemon at the new repo while it mints tokens for the old
+  # installation, so drop it and let configure-inner.sh rediscover.
+  log "Target repo changed ($current_repo -> $repo); discarding the previous installation ID so it is rediscovered."
+  installation_id=""
 fi
 ops_require_nonempty "REVIEWER_REPO" "$repo"
 ops_validate_owner_repo "$repo" REVIEWER_REPO

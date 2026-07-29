@@ -205,6 +205,42 @@ test_prompt_assembly() {
   build_review_prompt 999 "$prompt_file" "$diff_file" success abc123 "$worktree_dir" "$pr_metadata_json" "$previous_bot_reviews_json" "$prior_bot_threads_json"
   assert_contains "prompt caps prior review subject" "[goobreview: previous review subject truncated after 8 bytes]" "$prompt_file"
   PREVIOUS_REVIEW_MAX_BYTES=500
+
+  # A prior review that leads with the posted trace block must still summarize
+  # as the review. The trace writes bold paragraphs rather than headings, so
+  # without skipping the wrapper the subject resolves either to the literal
+  # "<details>" line or to the first heading *after* the trace -- in
+  # production that was "Reference Links", the review's closing section.
+  local traced_subject
+  traced_subject=$(printf '%s\n' \
+    '<details><summary>Review trace</summary>' \
+    '' \
+    '**Troubleshooting Sandbox Connection**' \
+    '' \
+    '**Confirming Variable Safety**' \
+    '' \
+    '</details>' \
+    '' \
+    '---' \
+    '' \
+    '## Auth fallback still unhandled' \
+    '' \
+    'Body text.' \
+    '' \
+    '### Reference Links' | review_subject_from_body)
+  assert_eq "prior review subject skips a leading trace block" \
+    "Auth fallback still unhandled" "$traced_subject"
+
+  traced_subject=$(printf '%s\n' \
+    '<details><summary>Review trace</summary>' \
+    '**Analyzing Command Execution Order**' \
+    '</details>' \
+    '' \
+    '---' \
+    '' \
+    'Plain review line with no heading.' | review_subject_from_body)
+  assert_eq "trace-led body falls back to the first review line, not the wrapper" \
+    "Plain review line with no heading." "$traced_subject"
   assert_contains "diff file includes changed paths with diffstat" "M client/src/auth.py (+1/-0)" "$diff_file"
   assert_not_contains "prompt no longer carries the trusted snapshot mount hint" "The PR-head source tree is mounted read-only at" "$prompt_file"
   assert_not_contains "prompt no longer carries the convention-docs pointer" "AGENTS.md, CONTRIBUTING.md, or GUIDELINES.md" "$prompt_file"

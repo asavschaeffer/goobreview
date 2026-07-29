@@ -240,6 +240,47 @@ Force a re-review of a PR at its current head commit:
 
 Delete the bot's review on GitHub (via the pull request UI or `gh api -X DELETE "repos/OWNER/REPO/pulls/PR/reviews/REVIEW_ID"`), then the daemon will re-review on the next tick.
 
+Repoint the daemon at a different repository:
+
+```bash
+scripts/configure.sh                      # answer the repo prompt with the new owner/repo
+# or, non-interactively:
+scripts/configure-inner.sh --repo NEW_OWNER/NEW_REPO
+```
+
+Changing the target repo also changes the App installation, so
+`REVIEWER_APP_INSTALLATION_ID` must change with it. Both scripts detect the
+repo change and rediscover the ID; do not carry the old one over by hand, or
+the daemon mints tokens for the previous installation and every API call
+against the new repo fails with a 404.
+
+The App must be installed on the new repository first. If it belongs to
+someone else's account or org, only an **admin there** can install it — you
+cannot do it for them, even with push access. Send them a link that pre-selects
+their account so the only choice left is the repository:
+
+```bash
+gh api users/THEIR_LOGIN --jq .id     # numeric account id
+# https://github.com/apps/YOUR_APP_SLUG/installations/new/permissions?suggested_target_id=THAT_ID
+```
+
+Nothing needs to come back from them once they click Install — the installation
+ID is discoverable from your side with `get-installation-token.sh discover`, and
+the cached token in `app_token.json` is keyed on the installation ID, so it
+invalidates itself when the ID changes.
+
+Two things worth re-checking after a repoint: `config/required-checks.json`
+still lists the *old* repo's check names (stale names never match, so the CI
+gate would block every review, while an empty `[]` means no gate at all), and a
+private new target with `REVIEWER_RESEARCH_CONSENT=1` also needs
+`REVIEWER_RESEARCH_ALLOW_PRIVATE=1` or capture silently stops.
+
+Write config backups outside the checkout — `/var/lib/goobreview/example/` is a
+good spot. A stray `config/reviewer.env.bak` used to leave the checkout dirty,
+which makes `sync-worktree.sh` refuse to sync and skip the tick entirely;
+`config/*.bak*` is gitignored now, but the general rule still holds for any
+other file you drop in the checkout.
+
 Run a pre-merge mechanical gate:
 
 ```bash
@@ -321,6 +362,8 @@ Env vars (set in `reviewer.env` or inline) beyond the required set:
 - `REVIEWER_ALLOW_STALE_CHECKOUT_ON_SYNC_FAILURE` — emergency/manual override; set to `1` only when you intentionally want a scheduler tick to run from the current checkout after sync fails. Default `0` fails closed.
 - `REVIEWER_ONLY_PR` — restrict a run (including `merge-gate.sh`) to a single PR number.
 - `REVIEWER_RUNTIME_STATE`, `REVIEWER_LOG_MAX_BYTES`, `REVIEWER_LOG_ROTATE_KEEP` — runtime dir and log rotation controls; see `config/reviewer.env.example`.
+- `REVIEWER_POST_REVIEW_TRACE` — default `0`. Set `1` to prefix the model's thinking trace onto the posted review body, collapsed in a `<details>` block. Off by default because the trace routinely runs many times the length of the review it is attached to, and `<details>` only collapses in a browser: the GitHub API serves it in full to every other reader, this daemon included when it reads its own prior review. Disabling it changes nothing about capture — the trace is still written to the runtime sidecar, to research artifacts under consent, and to agy's own transcripts.
+- `REVIEWER_TRACE_MAX_BYTES` — default `20000`. Caps the posted trace when the switch above is on, cutting on a line boundary and marking what it dropped. GitHub rejects review bodies over 65536 characters outright, so an uncapped trace does not degrade a review, it fails to post it.
 - `REVIEWER_AUTO_RESOLVE_BOT_THREADS` — default `0`. When set to `1`, a live review can resolve this bot's still-unresolved inline review threads after the review posts successfully, but only for valid handles (heading-derived slugs) explicitly listed under `Resolved Prior Threads`, and it posts a confirming reply before resolving each one. It never resolves human-created threads.
 
 ## Known Limits

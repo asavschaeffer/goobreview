@@ -2178,3 +2178,219 @@ EOF
   assert_eq "manifest records private visibility" "private" "$(jq -r '.repo_visibility' "$priv_manifest")"
   assert_eq "manifest records private eligibility" "private-consented" "$(jq -r '.research_eligible' "$priv_manifest")"
 }
+
+# REVIEWER_POST_REVIEW_TRACE only changes the body that is actually POSTED, so
+# a dry run cannot verify it: write_dry_run_artifact records the raw model
+# response, and the trace is prefixed onto the formatted body afterwards. This
+# stubs curl to capture the literal --data payload github_api_request hands it
+# and asserts on the posted JSON's .body across both flag states, with a small
+# REVIEWER_TRACE_MAX_BYTES so the cap is exercised end-to-end too.
+test_reviewer_posted_trace_flag_controls_review_body() {
+  local state_dir_off state_dir_on runtime_dir test_reviewer env_file key_file bin_dir
+  local source_dir tarball fixture_home posted_json posted_body status output
+
+  state_dir_off="$TMP_ROOT/trace-flag-state-off"
+  state_dir_on="$TMP_ROOT/trace-flag-state-on"
+  runtime_dir="$TMP_ROOT/trace-flag-runtime"
+  test_reviewer="$TMP_ROOT/trace-flag-reviewer"
+  bin_dir="$TMP_ROOT/trace-flag-bin"
+  source_dir="$TMP_ROOT/trace-flag-source"
+  tarball="$TMP_ROOT/trace-flag.tar.gz"
+  posted_json="$TMP_ROOT/trace-flag-posted.json"
+  posted_body="$TMP_ROOT/trace-flag-posted-body.txt"
+  fixture_home="$TMP_ROOT/trace-flag-home"
+  mkdir -p "$state_dir_off" "$state_dir_on" "$runtime_dir" "$bin_dir" "$fixture_home" "$source_dir/repo-root"
+  cp -R "$REVIEWER_DIR" "$test_reviewer"
+  printf 'hello\n' > "$source_dir/repo-root/README.md"
+  tar -czf "$tarball" -C "$source_dir" repo-root
+
+  cat > "$test_reviewer/get-installation-token.sh" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  token) printf 'test-token\n' ;;
+  slug)  printf 'goobreview\n' ;;
+  *)     exit 1 ;;
+esac
+EOF
+  chmod +x "$test_reviewer/get-installation-token.sh"
+
+  cat > "$test_reviewer/check-ci.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'success\n'
+EOF
+  chmod +x "$test_reviewer/check-ci.sh"
+
+  # github-api.sh passes the review JSON as a literal `--data <json>` argv pair,
+  # so the posted body is recoverable by walking argv for the value that follows
+  # --data. TRACE_POSTED_JSON names the capture file.
+  cat > "$bin_dir/curl" <<'EOF'
+#!/usr/bin/env bash
+body_file=""
+data=""
+prev=""
+url="${*: -1}"
+for arg in "$@"; do
+  case "$prev" in
+    -o) body_file="$arg" ;;
+    --data) data="$arg" ;;
+  esac
+  prev="$arg"
+done
+case "$url" in
+  *'/repos/example/repo')
+    printf '%s\n' '{"private":false}' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/pulls?state=open&per_page=100&page=1')
+    printf '%s\n' '[{"number":1,"draft":false,"user":{"login":"alice"},"head":{"sha":"sha1","ref":"feature"},"base":{"ref":"main"},"title":"Trace flag PR","body":"Please review","changed_files":1}]' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/pulls/1')
+    printf '%s\n' '{"number":1,"head":{"sha":"sha1"}}' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/pulls/1/reviews?per_page=100&page=1')
+    printf '%s\n' '[]' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/pulls/1/files?per_page=100&page=1')
+    printf '%s\n' '[{"filename":"README.md","status":"modified","additions":1,"deletions":0,"patch":"@@ -1,0 +1,1 @@\n+hello"}]' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/pulls/1/commits?per_page=100&page=1')
+    printf '%s\n' '[{"commit":{"message":"Update README"}}]' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/commits/sha1')
+    printf '%s\n' '{"commit":{"committer":{"date":"2026-01-01T00:00:00Z"}}}' > "$body_file"
+    printf '200'
+    ;;
+  *'/graphql')
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/tarball/sha1')
+    cat "$TRACE_TARBALL" > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/issues/1/reactions')
+    printf '%s\n' '{"id":1,"content":"eyes"}' > "$body_file"
+    printf '201'
+    ;;
+  *'/repos/example/repo/issues/1/comments?per_page=100&page=1')
+    printf '%s\n' '[]' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/check-runs')
+    printf '%s\n' '{"id":99}' > "$body_file"
+    printf '201'
+    ;;
+  *'/repos/example/repo/check-runs/99')
+    printf '%s\n' '{"id":99}' > "$body_file"
+    printf '200'
+    ;;
+  *'/repos/example/repo/pulls/1/reviews')
+    if [ -n "$data" ]; then
+      printf '%s\n' "$data" > "$TRACE_POSTED_JSON"
+    fi
+    printf '%s\n' '{"id":123}' > "$body_file"
+    printf '200'
+    ;;
+  *)
+    printf 'unexpected curl URL: %s\n' "$url" >&2
+    printf '000'
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$bin_dir/curl"
+
+  cat > "$bin_dir/timeout" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  --kill-after=*) shift ;;
+esac
+shift
+"$@"
+EOF
+  chmod +x "$bin_dir/timeout"
+
+  # The sidecar at $RUNTIME_STATE_DIR/agy-runtime/thinking.trace is rewritten by
+  # run_agy_review from the planner turn's `thinking` field on every invocation
+  # (and removed when there is no transcript), so the trace has to be planted
+  # the way a real run produces one: through a brain transcript.
+  cat > "$bin_dir/agy" <<'EOF'
+#!/usr/bin/env bash
+body=$'The README change is correct and safe to merge.\nAPPROVE'
+thinking="TRACE-HEAD-MARKER opening the snapshot to confirm the change."
+for i in $(seq 1 30); do
+  thinking="$thinking"$'\n'"Padding narration line $i that pads the recorded trace out."
+done
+thinking="$thinking"$'\n'"TRACE-TAIL-MARKER closing the snapshot after the last check."
+dir="$HOME/.gemini/antigravity-cli/brain/trace-flag-session/.system_generated/logs"
+mkdir -p "$dir"
+# Distinct mtime from the pre-agy marker (second resolution on some FS).
+sleep 0.05 2>/dev/null || true
+jq -nc --arg t "$thinking" --arg c "$body" \
+  '{type:"PLANNER_RESPONSE",thinking:$t,content:$c}' > "$dir/transcript_full.jsonl"
+printf '%s\n' "$body"
+EOF
+  chmod +x "$bin_dir/agy"
+
+  key_file="$TMP_ROOT/trace-flag-key.pem"
+  printf 'key\n' > "$key_file"
+  chmod 600 "$key_file"
+  printf '## Role\nReview.\n' > "$TMP_ROOT/trace-flag-personality.md"
+  printf 'Final non-empty line: APPROVE, REQUEST_CHANGES, or COMMENT.\n' > "$TMP_ROOT/trace-flag-engine.md"
+  printf '[]\n' > "$TMP_ROOT/trace-flag-required.json"
+
+  env_file="$TMP_ROOT/trace-flag.env"
+  cat > "$env_file" <<EOF
+REVIEWER_REPO=example/repo
+REVIEWER_STATE=$state_dir_off
+REVIEWER_RUNTIME_STATE=$runtime_dir
+REVIEWER_APP_ID=1
+REVIEWER_APP_INSTALLATION_ID=2
+REVIEWER_APP_PRIVATE_KEY_PATH=$key_file
+REVIEWER_PERSONALITY_FILE=$TMP_ROOT/trace-flag-personality.md
+REVIEWER_PROMPT=$TMP_ROOT/trace-flag-engine.md
+REVIEWER_REQUIRED_CHECKS_FILE=$TMP_ROOT/trace-flag-required.json
+REVIEWER_MAX_PRS=1
+REVIEWER_MAX_ATTEMPTS=1
+EOF
+
+  # Default (flag unset): the sidecar trace never reaches the posted body, but
+  # the model's own review still posts unchanged.
+  : > "$posted_json"
+  status=0
+  # shellcheck disable=SC1090 # Fixture env file is created dynamically above.
+  output=$(set -a; . "$env_file"; set +a; HOME="$fixture_home" TRACE_TARBALL="$tarball" TRACE_POSTED_JSON="$posted_json" PATH="$bin_dir:$PATH" bash "$test_reviewer/reviewer.sh" 2>&1) || status=$?
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$output" >&2
+    fail "trace-flag-off tick exits successfully"
+  fi
+  pass "trace-flag-off tick exits successfully"
+  jq -r '.body' "$posted_json" > "$posted_body"
+  assert_not_contains "posted body omits the sidecar trace when the flag is unset" "Review trace" "$posted_body"
+  assert_not_contains "posted body omits trace content when the flag is unset" "TRACE-HEAD-MARKER" "$posted_body"
+  assert_contains "flag-off tick still posts the model review body" "The README change is correct and safe to merge." "$posted_body"
+
+  # Flag on with a small cap: the trace is prefixed, linkified, and truncated on
+  # a line boundary with the marker naming the configured cap.
+  : > "$posted_json"
+  rm -rf "$fixture_home/.gemini"
+  status=0
+  # shellcheck disable=SC1090 # Fixture env file is created dynamically above.
+  output=$(set -a; . "$env_file"; set +a; REVIEWER_STATE="$state_dir_on" REVIEWER_POST_REVIEW_TRACE=1 REVIEWER_TRACE_MAX_BYTES=200 HOME="$fixture_home" TRACE_TARBALL="$tarball" TRACE_POSTED_JSON="$posted_json" PATH="$bin_dir:$PATH" bash "$test_reviewer/reviewer.sh" 2>&1) || status=$?
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$output" >&2
+    fail "trace-flag-on tick exits successfully"
+  fi
+  pass "trace-flag-on tick exits successfully"
+  jq -r '.body' "$posted_json" > "$posted_body"
+  assert_contains "posted body prefixes the sidecar trace when the flag is on" "<details><summary>Review trace</summary>" "$posted_body"
+  assert_contains "posted trace keeps the head of the sidecar" "TRACE-HEAD-MARKER" "$posted_body"
+  assert_contains "posted trace records the configured truncation cap" "[goobreview: review trace truncated after 200 bytes of" "$posted_body"
+  assert_not_contains "posted trace drops everything past the cap" "TRACE-TAIL-MARKER" "$posted_body"
+  assert_contains "flag-on tick still posts the model review body" "The README change is correct and safe to merge." "$posted_body"
+}
